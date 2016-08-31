@@ -7,6 +7,7 @@ require "#{ep}/ext/em"
 require "#{ep}/ext/bytesize"
 require "#{ep}/ext/json"
 require "#{ep}/version"
+require "concurrent"
 
 module NATS
 
@@ -25,6 +26,8 @@ module NATS
   # Ping intervals
   DEFAULT_PING_INTERVAL = 120
   DEFAULT_PING_MAX = 2
+
+  MULTITHREAD_PUBLISH = ENV.has_key?('NATS_MULTITHREAD_PUBLISH')
 
   # Protocol
   # @private
@@ -336,30 +339,60 @@ module NATS
   alias :closing? :closing
   alias :reconnecting? :reconnecting
 
-  def initialize(options)
-    @options = options
-    process_uri_options
+  if MULTITHREAD_PUBLISH
+    def initialize(options)
+      @options = options
+      process_uri_options
 
-    @buf = nil
-    @ssid, @subs = 1, {}
-    @err_cb = NATS.err_cb
-    @close_cb = NATS.close_cb
-    @reconnect_cb = NATS.reconnect_cb
-    @disconnect_cb = NATS.disconnect_cb
-    @reconnect_timer, @needed = nil, nil
-    @connected, @closing, @reconnecting, @conn_cb_called = false, false, false, false
-    @msgs_received = @msgs_sent = @bytes_received = @bytes_sent = @pings = 0
-    @pending_size = 0
-    @server_info = { }
+      @buf = nil
+      @ssid, @subs = 1, {}
+      @err_cb = NATS.err_cb
+      @close_cb = NATS.close_cb
+      @reconnect_cb = NATS.reconnect_cb
+      @disconnect_cb = NATS.disconnect_cb
+      @reconnect_timer, @needed = nil, nil
+      @connected, @closing, @reconnecting, @conn_cb_called = false, false, false, false
+      @msgs_received = @msgs_sent = @bytes_received = @bytes_sent = @pings = 0
+      @pending = ::Concurrent::AtomicReference.new(::Concurrent::Array.new)
+      @pending_size = 0
+      @server_info = { }
 
-    # Mark whether we should be connecting securely, try best effort
-    # in being compatible with present ssl support.
-    @ssl = false
-    @tls = nil
-    @tls = options[:tls] if options[:tls]
-    @ssl = options[:ssl] if options[:ssl] or @tls
+      # Mark whether we should be connecting securely, try best effort
+      # in being compatible with present ssl support.
+      @ssl = false
+      @tls = nil
+      @tls = options[:tls] if options[:tls]
+      @ssl = options[:ssl] if options[:ssl] or @tls
 
-    send_connect_command
+      send_connect_command
+    end
+
+  else
+    def initialize(options)
+      @options = options
+      process_uri_options
+
+      @buf = nil
+      @ssid, @subs = 1, {}
+      @err_cb = NATS.err_cb
+      @close_cb = NATS.close_cb
+      @reconnect_cb = NATS.reconnect_cb
+      @disconnect_cb = NATS.disconnect_cb
+      @reconnect_timer, @needed = nil, nil
+      @connected, @closing, @reconnecting, @conn_cb_called = false, false, false, false
+      @msgs_received = @msgs_sent = @bytes_received = @bytes_sent = @pings = 0
+      @pending_size = 0
+      @server_info = { }
+
+      # Mark whether we should be connecting securely, try best effort
+      # in being compatible with present ssl support.
+      @ssl = false
+      @tls = nil
+      @tls = options[:tls] if options[:tls]
+      @ssl = options[:ssl] if options[:ssl] or @tls
+
+      send_connect_command
+    end
   end
 
   # Publish a message to a given subject, with optional reply subject and completion block
@@ -577,10 +610,19 @@ module NATS
     end
   end
 
-  def flush_pending #:nodoc:
-    return unless @pending
-    send_data(@pending.join)
-    @pending, @pending_size = nil, 0
+  if MULTITHREAD_PUBLISH
+    def flush_pending #:nodoc:
+      return if @pending.get.empty?
+      p = @pending.swap(::Concurrent::Array.new)
+      send_data(p.join)
+      @pending_size = 0
+    end
+  else
+    def flush_pending #:nodoc:
+      return if @pending.empty?
+      send_data(@pending.join)
+      @pending, @pending_size = nil, 0
+    end
   end
 
   def receive_data(data) #:nodoc:
@@ -750,46 +792,92 @@ module NATS
     process_connect
   end
 
-  def process_connect #:nodoc:
-    # Reset reconnect attempts since TCP connection has been successful at this point.
-    current = server_pool.first
-    current[:was_connected] = true
-    current[:reconnect_attempts] ||= 0
-    cancel_reconnect_timer if reconnecting?
+  if MULTITHREAD_PUBLISH
+    def process_connect #:nodoc:
+      # Reset reconnect attempts since TCP connection has been successful at this point.
+      current = server_pool.first
+      current[:was_connected] = true
+      current[:reconnect_attempts] ||= 0
+      cancel_reconnect_timer if reconnecting?
 
-    # Whip through any pending SUB commands since we replay
-    # all subscriptions already done anyway.
-    @pending.delete_if { |sub| sub[0..2] == SUB_OP } if @pending
-    @subs.each_pair { |k, v| send_command("SUB #{v[:subject]} #{v[:queue]} #{k}#{CR_LF}") }
+      # Whip through any pending SUB commands since we replay
+      # all subscriptions already done anyway.
+      # @pending.delete_if { |sub| sub[0..2] == SUB_OP } if @pending
+      @pending.get.delete_if { |sub| sub[0..2] == SUB_OP }
+      @subs.each_pair { |k, v| send_command("SUB #{v[:subject]} #{v[:queue]} #{k}#{CR_LF}") }
 
-    unless user_err_cb? or reconnecting?
-      @err_cb = proc { |e| raise e }
-    end
+      unless user_err_cb? or reconnecting?
+        @err_cb = proc { |e| raise e }
+      end
 
-    # We have validated the connection at this point so send CONNECT
-    # and any other pending commands which we need to the server.
-    flush_pending
+      # We have validated the connection at this point so send CONNECT
+      # and any other pending commands which we need to the server.
+      flush_pending
 
-    if (connect_cb and not @conn_cb_called)
-      # We will round trip the server here to make sure all state from any pending commands
-      # has been processed before calling the connect callback.
-      queue_server_rt do
-        connect_cb.call(self)
-        @conn_cb_called = true
+      if (connect_cb and not @conn_cb_called)
+        # We will round trip the server here to make sure all state from any pending commands
+        # has been processed before calling the connect callback.
+        queue_server_rt do
+          connect_cb.call(self)
+          @conn_cb_called = true
+        end
+      end
+
+      # Notify via reconnect callback that we are again plugged again into the system.
+      if reconnecting?
+        @reconnecting = false
+        @reconnect_cb.call(self) unless @reconnect_cb.nil?
+      end
+
+      # Initialize ping timer and processing
+      @pings_outstanding = 0
+      @pongs_received = 0
+      @ping_timer = EM.add_periodic_timer(@options[:ping_interval]) do
+        send_ping
       end
     end
+  else
+    def process_connect #:nodoc:
+      # Reset reconnect attempts since TCP connection has been successful at this point.
+      current = server_pool.first
+      current[:was_connected] = true
+      current[:reconnect_attempts] ||= 0
+      cancel_reconnect_timer if reconnecting?
 
-    # Notify via reconnect callback that we are again plugged again into the system.
-    if reconnecting?
-      @reconnecting = false
-      @reconnect_cb.call(self) unless @reconnect_cb.nil?
-    end
+      # Whip through any pending SUB commands since we replay
+      # all subscriptions already done anyway.
+      @pending.delete_if { |sub| sub[0..2] == SUB_OP } unless @pending.empty?
+      @subs.each_pair { |k, v| send_command("SUB #{v[:subject]} #{v[:queue]} #{k}#{CR_LF}") }
 
-    # Initialize ping timer and processing
-    @pings_outstanding = 0
-    @pongs_received = 0
-    @ping_timer = EM.add_periodic_timer(@options[:ping_interval]) do
-      send_ping
+      unless user_err_cb? or reconnecting?
+        @err_cb = proc { |e| raise e }
+      end
+
+      # We have validated the connection at this point so send CONNECT
+      # and any other pending commands which we need to the server.
+      flush_pending
+
+      if (connect_cb and not @conn_cb_called)
+        # We will round trip the server here to make sure all state from any pending commands
+        # has been processed before calling the connect callback.
+        queue_server_rt do
+          connect_cb.call(self)
+          @conn_cb_called = true
+        end
+      end
+
+      # Notify via reconnect callback that we are again plugged again into the system.
+      if reconnecting?
+        @reconnecting = false
+        @reconnect_cb.call(self) unless @reconnect_cb.nil?
+      end
+
+      # Initialize ping timer and processing
+      @pings_outstanding = 0
+      @pongs_received = 0
+      @ping_timer = EM.add_periodic_timer(@options[:ping_interval]) do
+        send_ping
+      end
     end
   end
 
@@ -820,22 +908,43 @@ module NATS
     @reconnect_timer = EM.add_timer(@options[:reconnect_time_wait]) { attempt_reconnect }
   end
 
-  def unbind #:nodoc:
-    # Allow notifying from which server we were disconnected,
-    # but only when we didn't trigger disconnecting ourselves.
-    if @disconnect_cb and connected? and not closing?
-      disconnect_cb.call(NATS::ConnectError.new(disconnect_error_string))
+  if MULTITHREAD_PUBLISH
+    def unbind #:nodoc:
+      # Allow notifying from which server we were disconnected,
+      # but only when we didn't trigger disconnecting ourselves.
+      if @disconnect_cb and connected? and not closing?
+        disconnect_cb.call(NATS::ConnectError.new(disconnect_error_string))
+      end
+
+      # If we are closing or shouldn't reconnect, go ahead and disconnect.
+      process_disconnect and return if (closing? or should_not_reconnect?)
+      @reconnecting = true if connected?
+      @connected = false
+      @pending = ::Concurrent::Array.new
+      @pongs = nil
+      @buf = nil
+      cancel_ping_timer
+
+      schedule_primary_and_connect
     end
+  else
+    def unbind #:nodoc:
+      # Allow notifying from which server we were disconnected,
+      # but only when we didn't trigger disconnecting ourselves.
+      if @disconnect_cb and connected? and not closing?
+        disconnect_cb.call(NATS::ConnectError.new(disconnect_error_string))
+      end
 
-    # If we are closing or shouldn't reconnect, go ahead and disconnect.
-    process_disconnect and return if (closing? or should_not_reconnect?)
-    @reconnecting = true if connected?
-    @connected = false
-    @pending = @pongs = nil
-    @buf = nil
-    cancel_ping_timer
+      # If we are closing or shouldn't reconnect, go ahead and disconnect.
+      process_disconnect and return if (closing? or should_not_reconnect?)
+      @reconnecting = true if connected?
+      @connected = false
+      @pending = @pongs = nil
+      @buf = nil
+      cancel_ping_timer
 
-    schedule_primary_and_connect
+      schedule_primary_and_connect
+    end
   end
 
   def multiple_servers_available?
@@ -903,21 +1012,36 @@ module NATS
     end
   end
 
-  def send_command(command, priority = false) #:nodoc:
-    needs_flush = (connected? && @pending.nil?)
+  if MULTITHREAD_PUBLISH
+    def send_command(command, priority = false) #:nodoc:
+      @pending.get << command unless priority
+      @pending.get.unshift(command) if priority
+      @pending_size += command.bytesize
 
-    @pending ||= []
-    @pending << command unless priority
-    @pending.unshift(command) if priority
-    @pending_size += command.bytesize
+      EM.next_tick { flush_pending } if connected?
 
-    EM.next_tick { flush_pending } if needs_flush
-
-    flush_pending if (connected? && @pending_size > MAX_PENDING_SIZE)
-    if (@options[:fast_producer_error] && pending_data_size > FAST_PRODUCER_THRESHOLD)
-      err_cb.call(NATS::ClientError.new("Fast Producer: #{pending_data_size} bytes outstanding"))
+      flush_pending if (connected? && @pending_size > MAX_PENDING_SIZE)
+      if (@options[:fast_producer_error] && pending_data_size > FAST_PRODUCER_THRESHOLD)
+        err_cb.call(NATS::ClientError.new("Fast Producer: #{pending_data_size} bytes outstanding"))
+      end
+      true
     end
-    true
+  else
+    def send_command(command, priority = false) #:nodoc:
+      needs_flush = (connected? && @pending.empty?)
+
+      @pending << command unless priority
+      @pending.unshift(command) if priority
+      @pending_size += command.bytesize
+
+      EM.next_tick { flush_pending } if needs_flush
+
+      flush_pending if (connected? && @pending_size > MAX_PENDING_SIZE)
+      if (@options[:fast_producer_error] && pending_data_size > FAST_PRODUCER_THRESHOLD)
+        err_cb.call(NATS::ClientError.new("Fast Producer: #{pending_data_size} bytes outstanding"))
+      end
+      true
+    end
   end
 
   # Parse out URIs which can now be an array of server choices

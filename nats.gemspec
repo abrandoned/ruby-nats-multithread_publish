@@ -17,6 +17,7 @@ spec = Gem::Specification.new do |s|
   s.authors = ['Derek Collison']
   s.email = ['derek.collison@gmail.com']
   s.add_dependency('eventmachine', '~> 1.2', '>= 1.2.0')
+  s.add_dependency('concurrent-ruby')
 
   s.require_paths = ['lib']
   s.bindir = 'bin'
