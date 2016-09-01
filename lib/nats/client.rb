@@ -981,6 +981,8 @@ if ENV.has_key? "NATS_MULTITHREAD_PUBLISHER"
   case ENV["NATS_MULTITHREAD_PUBLISHER"]
   when "atomic_reference"
     require "nats/atomic_reference_client"
+  when "concurrent_map"
+    require "nats/concurrent_map_client"
   else
   end
 end
