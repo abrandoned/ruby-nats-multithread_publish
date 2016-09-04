@@ -18,7 +18,7 @@ module NATS
     @reconnect_timer, @needed = nil, nil
     @connected, @closing, @reconnecting, @conn_cb_called = false, false, false, false
     @msgs_received = @msgs_sent = @bytes_received = @bytes_sent = @pings = 0
-    @pending = ::Concurrent::Map.new
+    @pending = ::Concurrent::Map.new(:pending => "", :subs => "")
     @pending_size = ::Concurrent::AtomicFixnum.new(0)
     @server_info = { }
 
@@ -33,13 +33,26 @@ module NATS
   end
 
   def flush_pending #:nodoc:
-    pending = @pending.get_and_set(:pending, "")
-    sub_commands = @pending.get_and_set(:subs, "")
+    pending = @pending.get_and_set(:pending, nil)
+    sub_commands = @pending.get_and_set(:subs, nil)
 
-    send_data(sub_commands) if sub_commands && !sub_commands.empty?
-    send_data(pending) if pending && !pending.empty?
+    send_data(sub_commands) if sub_commands
+    send_data(pending) if pending
 
     @pending_size.decrement(@pending_size.value)
+  rescue
+    raise if connected?
+    puts "throwing things away"
+  end
+
+  def get_outbound_data_size
+    if connected?
+      super
+    else
+      0
+    end
+  rescue
+    return   0
   end
 
   def pending_data_size
@@ -55,7 +68,7 @@ module NATS
 
     # Whip through any pending SUB commands since we replay
     # all subscriptions already done anyway.
-    @pending.get_and_set(:subs, "")
+    @pending.get_and_set(:subs, nil)
     @subs.each_pair { |k, v| send_command("SUB #{v[:subject]} #{v[:queue]} #{k}#{CR_LF}") }
 
     unless user_err_cb? or reconnecting?
@@ -117,7 +130,7 @@ module NATS
       end
     else
       @pending.compute(:pending) do |val|
-        was_empty = val.empty?
+        was_empty = val.nil?
         priority ? "#{command}#{val}" : "#{val}#{command}"
       end
     end

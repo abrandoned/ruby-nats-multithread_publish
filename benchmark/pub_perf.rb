@@ -15,6 +15,7 @@ TSIZE = 4*1024
 
 $sub  = 'test'
 $data_size = 16
+$pool = 8
 
 $hash  = 2500
 
@@ -41,7 +42,11 @@ NATS.on_error { |err| puts "Error: #{err}"; exit! }
 
 $data = Array.new($data_size) { "%01x" % rand(16) }.join('').freeze
 
-NATS.start(:fast_producer_error => true) do
+NATS.start(
+  :fast_producer_error => true,
+  servers: ["nats://localhost:4222", "nats://localhost:5222", "nats://localhost:6222"],
+  dont_randomize_servers: true,
+) do
 
   $start   = Time.now
   $to_send = $count
@@ -51,7 +56,7 @@ NATS.start(:fast_producer_error => true) do
   def send_batch
     (0..$batch).each do
       $to_send -= 1
-      if $to_send == 0
+      if $to_send <= 0
         NATS.publish($sub, $data) { display_final_results }
         return
       else
@@ -60,20 +65,14 @@ NATS.start(:fast_producer_error => true) do
       printf('+') if $to_send.modulo($hash) == 0
     end
 
-    if (NATS.pending_data_size > TRIP)
-      $delay *= 2
-    elsif $delay > $dmin
-      $delay /= 2
-    end
+    # if (NATS.pending_data_size > TRIP)
+    #   $delay *= 2
+    # elsif $delay > $dmin
+    #   $delay /= 2
+    # end
 
-    EM.add_timer($delay) { send_batch }
-  end
-
-  def display_final_results
-    elapsed = Time.now - $start
-    mbytes = sprintf("%.1f", (($data_size*$count)/elapsed)/(1024*1024))
-    puts "\nTest completed : #{($count/elapsed).ceil} msgs/sec (#{mbytes} MB/sec)\n"
-    NATS.stop
+    send_batch
+    # EM.add_timer($delay) { send_batch }
   end
 
   if false
@@ -84,7 +83,48 @@ NATS.start(:fast_producer_error => true) do
 
   puts "Sending #{$count} messages of size #{$data.size} bytes on [#{$sub}]"
 
-  # kick things off..
-  send_batch
+  def display_final_results
+    if NATS.client.get_outbound_data_size > 0
+      puts "pending data size = #{NATS.pending_data_size}: delaying results"
+      puts "outbound data size = #{NATS.client.get_outbound_data_size}: delaying results"
+      EM.next_tick { display_final_results }
+    else
+      elapsed = Time.now - $start
+      mbytes = sprintf("%.1f", (($data_size*$count)/elapsed)/(1024*1024))
+      puts "\nTest completed : #{($count/elapsed).ceil} msgs/sec (#{mbytes} MB/sec)\n"
+      puts "pending data size = #{NATS.pending_data_size}"
+      puts "outbound data size = #{NATS.client.get_outbound_data_size}"
+      puts "pool = #{$pool}"
+      EM.next_tick { NATS.stop }
+    end
+  end
 
+  def wait_for_threads(threads)
+    alive = threads.count { |t| t.alive? }
+
+    if alive > 0
+      #puts "waiting for #{alive} threads: #{NATS.pending_data_size}, #{NATS.client.get_outbound_data_size}"
+      # threads.each { |t| puts t.backtrace.join("\n") if t.alive? }
+      EM.add_timer(alive/$pool) { wait_for_threads(threads) }
+    else
+      puts "threads finished"
+      display_final_results
+    end
+  end
+
+  # kick things off..
+  total_msgs = $count
+  threads = $pool.times.map do
+    Thread.new do
+      (total_msgs/$pool).times do
+        if NATS.client.get_outbound_data_size > 1024**2
+          sleep 0.01 until NATS.client.get_outbound_data_size < 1024
+        end
+        NATS.publish($sub, $data)
+      end
+    end
+  end
+
+  EM.next_tick { wait_for_threads(threads) }
 end
+
